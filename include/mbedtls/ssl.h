@@ -111,6 +111,8 @@
 #define MBEDTLS_ERR_SSL_HW_ACCEL_FAILED                   -0x7F80
 /** Hardware acceleration function skipped / left alone data */
 #define MBEDTLS_ERR_SSL_HW_ACCEL_FALLTHROUGH              -0x6F80
+/** The server has no certificate types in common with the client (RFC 7250 raw public key patch, non-upstream). */
+#define MBEDTLS_ERR_SSL_NO_CERTIFICATE_TYPE_CHOSEN        -0x7FFF
 /** Handshake protocol not within min/max boundaries */
 #define MBEDTLS_ERR_SSL_BAD_PROTOCOL_VERSION              -0x6E80
 /** The handshake negotiation failed. */
@@ -342,6 +344,15 @@
 
 #define MBEDTLS_SSL_ANTI_REPLAY_DISABLED        0
 #define MBEDTLS_SSL_ANTI_REPLAY_ENABLED         1
+
+/* Non-upstream: skip sending/receiving the (D)TLS Certificate message
+ * altogether (used e.g. when authentication happens purely via the raw
+ * public key carried in the handshake, or is not required at all). */
+#define MBEDTLS_SSL_SEND_CERTIFICATE_DISABLED   0
+#define MBEDTLS_SSL_SEND_CERTIFICATE_ENABLED    1
+
+#define MBEDTLS_SSL_RECEIVE_CERTIFICATE_DISABLED 0
+#define MBEDTLS_SSL_RECEIVE_CERTIFICATE_ENABLED  1
 
 #define MBEDTLS_SSL_RENEGOTIATION_NOT_ENFORCED  -1
 #define MBEDTLS_SSL_RENEGO_MAX_RECORDS_DEFAULT  16
@@ -663,6 +674,18 @@
 #endif
 
 #define MBEDTLS_TLS_EXT_ECJPAKE_KKPP               256 /* experimental */
+
+/**
+ * TLS Certificate Types, see RFC 7250. Values as sent on the wire in the
+ * client_certificate_type/server_certificate_type extensions (MBEDTLS_TLS_
+ * EXT_CLI_CERT_TYPE/MBEDTLS_TLS_EXT_SERV_CERT_TYPE above) and negotiated in
+ * mbedtls_ssl_handshake_params::client_cert_type/server_cert_type. This is a
+ * non-upstream addition (upstream mbedTLS only defines the extension IDs,
+ * not the RFC 7250 negotiation itself).
+ */
+#define MBEDTLS_TLS_CERT_TYPE_NONE            -1
+#define MBEDTLS_TLS_CERT_TYPE_X509             0
+#define MBEDTLS_TLS_CERT_TYPE_RAW_PUBLIC_KEY   2
 
 #define MBEDTLS_TLS_EXT_RENEGOTIATION_INFO      0xFF01
 
@@ -1536,6 +1559,12 @@ struct mbedtls_ssl_config {
                                                        in the use_srtp extension? */
 #endif
 
+    /* Non-upstream: allow the Certificate message to be skipped entirely
+     * in either direction (see mbedtls_ssl_conf_certificate_send/receive
+     * below), independently of RFC 7250 raw public keys. */
+    uint8_t MBEDTLS_PRIVATE(send_certificate);
+    uint8_t MBEDTLS_PRIVATE(receive_certificate);
+
     /*
      * Pointers
      */
@@ -1615,6 +1644,16 @@ struct mbedtls_ssl_config {
     void *MBEDTLS_PRIVATE(p_ca_cb);
 #endif /* MBEDTLS_X509_TRUSTED_CERTIFICATE_CALLBACK */
 #endif /* MBEDTLS_X509_CRT_PARSE_C */
+
+#if defined(MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT)
+    /* Non-upstream RFC 7250 raw public key support: 0-terminated,
+     * MBEDTLS_TLS_CERT_TYPE_NONE-sentinel lists of certificate types we are
+     * willing to send/accept as our own/the peer's certificate, in
+     * preference order. See mbedtls_ssl_conf_client/server_certificate_types
+     * below. */
+    const int *MBEDTLS_PRIVATE(client_certificate_type_list);
+    const int *MBEDTLS_PRIVATE(server_certificate_type_list);
+#endif /* MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT */
 
 #if defined(MBEDTLS_SSL_ASYNC_PRIVATE)
 #if defined(MBEDTLS_X509_CRT_PARSE_C)
@@ -2201,6 +2240,56 @@ void mbedtls_ssl_conf_transport(mbedtls_ssl_config *conf, int transport);
  *                 \c mbedtls_ssl_conf_session_tickets_cb() (server-side).
  */
 void mbedtls_ssl_conf_authmode(mbedtls_ssl_config *conf, int authmode);
+
+#if defined(MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT)
+/**
+ * \brief          Set the allowed/preferred client certificate types
+ *                 (RFC 7250), in preference order, 0-terminated. Non-upstream.
+ *
+ * \param conf       The SSL configuration to use.
+ * \param cert_types 0-terminated array of MBEDTLS_TLS_CERT_TYPE_XXX values,
+ *                   or NULL to disable the client_certificate_type
+ *                   extension entirely.
+ */
+void mbedtls_ssl_conf_client_certificate_types(mbedtls_ssl_config *conf,
+                                                const int *cert_types);
+
+/**
+ * \brief          Set the allowed/preferred server certificate types
+ *                 (RFC 7250), in preference order, 0-terminated. Non-upstream.
+ *
+ * \param conf       The SSL configuration to use.
+ * \param cert_types 0-terminated array of MBEDTLS_TLS_CERT_TYPE_XXX values,
+ *                   or NULL to disable the server_certificate_type
+ *                   extension entirely.
+ */
+void mbedtls_ssl_conf_server_certificate_types(mbedtls_ssl_config *conf,
+                                                const int *cert_types);
+#endif /* MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT */
+
+/**
+ * \brief          Enable or disable sending our own Certificate message
+ *                 during the handshake. Non-upstream.
+ *                 Default: MBEDTLS_SSL_SEND_CERTIFICATE_ENABLED.
+ *
+ * \param conf             The SSL configuration to use.
+ * \param send_certificate MBEDTLS_SSL_SEND_CERTIFICATE_ENABLED or
+ *                         MBEDTLS_SSL_SEND_CERTIFICATE_DISABLED.
+ */
+void mbedtls_ssl_conf_certificate_send(mbedtls_ssl_config *conf,
+                                        int send_certificate);
+
+/**
+ * \brief          Enable or disable expecting/reading the peer's
+ *                 Certificate message during the handshake. Non-upstream.
+ *                 Default: MBEDTLS_SSL_RECEIVE_CERTIFICATE_ENABLED.
+ *
+ * \param conf                The SSL configuration to use.
+ * \param receive_certificate MBEDTLS_SSL_RECEIVE_CERTIFICATE_ENABLED or
+ *                            MBEDTLS_SSL_RECEIVE_CERTIFICATE_DISABLED.
+ */
+void mbedtls_ssl_conf_certificate_receive(mbedtls_ssl_config *conf,
+                                           int receive_certificate);
 
 #if defined(MBEDTLS_SSL_EARLY_DATA)
 /**

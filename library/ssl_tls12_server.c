@@ -661,6 +661,86 @@ static int ssl_parse_use_srtp_ext(mbedtls_ssl_context *ssl,
 }
 #endif /* MBEDTLS_SSL_DTLS_SRTP */
 
+#if defined(MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT)
+/* RFC 7250: the client proposes the certificate types it is willing to use
+ * as its own ("client_certificate_type") and/or is willing to accept from
+ * us ("server_certificate_type"), in preference order. We pick the first
+ * one we're configured to accept and stash it in the handshake state; the
+ * choice is echoed back in the ServerHello (see ssl_write_client/
+ * server_certificate_type_ext below) and drives how mbedtls_ssl_write_
+ * certificate()/ssl_parse_certificate_chain() encode/decode the Certificate
+ * message for this handshake. Non-upstream. */
+static int ssl_parse_client_cert_type_ext(mbedtls_ssl_context *ssl,
+                                          const unsigned char *buf,
+                                          size_t len)
+{
+    size_t list_size;
+    const unsigned char *p;
+
+    if (len < 1) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("bad client hello message"));
+        return MBEDTLS_ERR_SSL_DECODE_ERROR;
+    }
+
+    list_size = buf[0];
+    if (list_size + 1 != len) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("bad client hello message"));
+        return MBEDTLS_ERR_SSL_DECODE_ERROR;
+    }
+
+    p = buf + 1;
+    while (list_size > 0) {
+        if (mbedtls_ssl_check_client_certificate_type(ssl, p[0]) == 0) {
+            ssl->handshake->client_cert_type = p[0];
+            MBEDTLS_SSL_DEBUG_MSG(4, ("%d client certificate type selected", p[0]));
+            return 0;
+        }
+
+        list_size--;
+        p++;
+    }
+
+    mbedtls_ssl_send_alert_message(ssl, MBEDTLS_SSL_ALERT_LEVEL_FATAL,
+                                   MBEDTLS_SSL_ALERT_MSG_UNSUPPORTED_CERT);
+    return MBEDTLS_ERR_SSL_NO_CERTIFICATE_TYPE_CHOSEN;
+}
+
+static int ssl_parse_server_cert_type_ext(mbedtls_ssl_context *ssl,
+                                          const unsigned char *buf,
+                                          size_t len)
+{
+    size_t list_size;
+    const unsigned char *p;
+
+    if (len < 1) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("bad client hello message"));
+        return MBEDTLS_ERR_SSL_DECODE_ERROR;
+    }
+
+    list_size = buf[0];
+    if (list_size + 1 != len) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("bad client hello message"));
+        return MBEDTLS_ERR_SSL_DECODE_ERROR;
+    }
+
+    p = buf + 1;
+    while (list_size > 0) {
+        if (mbedtls_ssl_check_server_certificate_type(ssl, p[0]) == 0) {
+            ssl->handshake->server_cert_type = p[0];
+            MBEDTLS_SSL_DEBUG_MSG(4, ("%d server certificate type selected", p[0]));
+            return 0;
+        }
+
+        list_size--;
+        p++;
+    }
+
+    mbedtls_ssl_send_alert_message(ssl, MBEDTLS_SSL_ALERT_LEVEL_FATAL,
+                                   MBEDTLS_SSL_ALERT_MSG_UNSUPPORTED_CERT);
+    return MBEDTLS_ERR_SSL_NO_CERTIFICATE_TYPE_CHOSEN;
+}
+#endif /* MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT */
+
 /*
  * Auxiliary functions for ServerHello parsing and related actions
  */
@@ -736,8 +816,27 @@ static int ssl_pick_cert(mbedtls_ssl_context *ssl,
 
     for (cur = list; cur != NULL; cur = cur->next) {
         flags = 0;
-        MBEDTLS_SSL_DEBUG_CRT(3, "candidate certificate chain, certificate",
-                              cur->cert);
+
+        mbedtls_x509_crt *cert = cur->cert;
+        void *key = &cur->cert->pk;
+#if defined(MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT)
+        /* RFC 7250: a key_cert entry provisioned for raw-public-key-only use
+         * may carry no valid X.509 wrapper certificate at all (cur->cert
+         * left zero-initialized, only cur->key set) - mbedtls_ssl_conf_own_cert
+         * still requires a non-NULL mbedtls_x509_crt* for its API, but there
+         * is nothing meaningful to check/send in that case. Resolve the key
+         * to use for the checks below to the raw key in that case instead of
+         * dereferencing the empty cert. Non-upstream. */
+        if (cur->cert == NULL || mbedtls_pk_get_type(&cur->cert->pk) == MBEDTLS_PK_NONE) {
+            MBEDTLS_SSL_DEBUG_MSG(3, ("candidate certificate type: raw public key"));
+            cert = NULL;
+            key = cur->key;
+        } else
+#endif /* MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT */
+        {
+            MBEDTLS_SSL_DEBUG_CRT(3, "candidate certificate chain, certificate",
+                                  cert);
+        }
 
         int key_type_matches = 0;
 #if defined(MBEDTLS_USE_PSA_CRYPTO)
@@ -745,13 +844,13 @@ static int ssl_pick_cert(mbedtls_ssl_context *ssl,
         key_type_matches = ((ssl->conf->f_async_sign_start != NULL ||
                              ssl->conf->f_async_decrypt_start != NULL ||
                              mbedtls_pk_can_do_ext(cur->key, pk_alg, pk_usage)) &&
-                            mbedtls_pk_can_do_ext(&cur->cert->pk, pk_alg, pk_usage));
+                            mbedtls_pk_can_do_ext((mbedtls_pk_context *) key, pk_alg, pk_usage));
 #else
         key_type_matches = (
             mbedtls_pk_can_do_ext(cur->key, pk_alg, pk_usage));
 #endif /* MBEDTLS_SSL_ASYNC_PRIVATE */
 #else
-        key_type_matches = mbedtls_pk_can_do(&cur->cert->pk, pk_alg);
+        key_type_matches = mbedtls_pk_can_do((mbedtls_pk_context *) key, pk_alg);
 #endif /* MBEDTLS_USE_PSA_CRYPTO */
         if (!key_type_matches) {
             MBEDTLS_SSL_DEBUG_MSG(3, ("certificate mismatch: key type"));
@@ -765,8 +864,12 @@ static int ssl_pick_cert(mbedtls_ssl_context *ssl,
          * It also allows the user to provision different certificates for
          * different uses based on keyUsage, eg if they want to avoid signing
          * and decrypting with the same RSA key.
+         *
+         * Skipped when there is no real X.509 certificate to check (raw
+         * public key only): those extensions don't exist in that case.
          */
-        if (mbedtls_ssl_check_cert_usage(cur->cert, ciphersuite_info,
+        if (cert != NULL &&
+            mbedtls_ssl_check_cert_usage(cert, ciphersuite_info,
                                          MBEDTLS_SSL_IS_CLIENT,
                                          MBEDTLS_SSL_VERSION_TLS1_2,
                                          &flags) != 0) {
@@ -777,7 +880,7 @@ static int ssl_pick_cert(mbedtls_ssl_context *ssl,
 
 #if defined(MBEDTLS_KEY_EXCHANGE_ECDSA_CERT_REQ_ALLOWED_ENABLED)
         if (pk_alg == MBEDTLS_PK_ECDSA &&
-            ssl_check_key_curve(&cur->cert->pk,
+            ssl_check_key_curve(key,
                                 ssl->handshake->curves_tls_id) != 0) {
             MBEDTLS_SSL_DEBUG_MSG(3, ("certificate mismatch: elliptic curve"));
             continue;
@@ -791,8 +894,15 @@ static int ssl_pick_cert(mbedtls_ssl_context *ssl,
     /* Do not update ssl->handshake->key_cert unless there is a match */
     if (cur != NULL) {
         ssl->handshake->key_cert = cur;
-        MBEDTLS_SSL_DEBUG_CRT(3, "selected certificate chain, certificate",
-                              ssl->handshake->key_cert->cert);
+#if defined(MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT)
+        if (cur->cert == NULL || mbedtls_pk_get_type(&cur->cert->pk) == MBEDTLS_PK_NONE) {
+            MBEDTLS_SSL_DEBUG_MSG(3, ("selected certificate type: raw public key"));
+        } else
+#endif /* MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT */
+        {
+            MBEDTLS_SSL_DEBUG_CRT(3, "selected certificate chain, certificate",
+                                  ssl->handshake->key_cert->cert);
+        }
         return 0;
     }
 
@@ -1403,6 +1513,28 @@ static int ssl_parse_client_hello(mbedtls_ssl_context *ssl)
                 break;
 #endif /* MBEDTLS_SSL_DTLS_SRTP */
 
+#if defined(MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT)
+            case MBEDTLS_TLS_EXT_CLI_CERT_TYPE:
+                MBEDTLS_SSL_DEBUG_MSG(3, ("found client_certificate_type extension"));
+                ssl->handshake->cli_exts |= MBEDTLS_TLS_EXT_CLIENT_CERTIFICATE_TYPE_PRESENT;
+
+                ret = ssl_parse_client_cert_type_ext(ssl, ext + 4, ext_size);
+                if (ret != 0) {
+                    return ret;
+                }
+                break;
+
+            case MBEDTLS_TLS_EXT_SERV_CERT_TYPE:
+                MBEDTLS_SSL_DEBUG_MSG(3, ("found server_certificate_type extension"));
+                ssl->handshake->cli_exts |= MBEDTLS_TLS_EXT_SERVER_CERTIFICATE_TYPE_PRESENT;
+
+                ret = ssl_parse_server_cert_type_ext(ssl, ext + 4, ext_size);
+                if (ret != 0) {
+                    return ret;
+                }
+                break;
+#endif /* MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT */
+
             default:
                 MBEDTLS_SSL_DEBUG_MSG(3, ("unknown extension found: %u (ignoring)",
                                           ext_id));
@@ -1972,6 +2104,70 @@ static void ssl_write_use_srtp_ext(mbedtls_ssl_context *ssl,
 }
 #endif /* MBEDTLS_SSL_DTLS_SRTP */
 
+#if defined(MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT)
+/* RFC 7250: echo back the certificate type we picked in
+ * ssl_parse_client_cert_type_ext()/ssl_parse_server_cert_type_ext() above,
+ * but only if the client actually sent the corresponding extension.
+ * Non-upstream. */
+static void ssl_write_client_certificate_type_ext(mbedtls_ssl_context *ssl,
+                                                   unsigned char *buf,
+                                                   size_t *olen)
+{
+    unsigned char *p = buf;
+    const unsigned char *end = ssl->out_msg + MBEDTLS_SSL_OUT_CONTENT_LEN;
+
+    *olen = 0;
+
+    if ((ssl->handshake->cli_exts &
+         MBEDTLS_TLS_EXT_CLIENT_CERTIFICATE_TYPE_PRESENT) == 0) {
+        return;
+    }
+
+    MBEDTLS_SSL_DEBUG_MSG(3, ("server hello, adding client_certificate_type extension"));
+
+    if (end - p < 5) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("buffer too small"));
+        return;
+    }
+
+    MBEDTLS_PUT_UINT16_BE(MBEDTLS_TLS_EXT_CLI_CERT_TYPE, p, 0);
+    p[2] = 0x00;
+    p[3] = 1;
+    p[4] = (unsigned char) ssl->handshake->client_cert_type;
+
+    *olen = 5;
+}
+
+static void ssl_write_server_certificate_type_ext(mbedtls_ssl_context *ssl,
+                                                   unsigned char *buf,
+                                                   size_t *olen)
+{
+    unsigned char *p = buf;
+    const unsigned char *end = ssl->out_msg + MBEDTLS_SSL_OUT_CONTENT_LEN;
+
+    *olen = 0;
+
+    if ((ssl->handshake->cli_exts &
+         MBEDTLS_TLS_EXT_SERVER_CERTIFICATE_TYPE_PRESENT) == 0) {
+        return;
+    }
+
+    MBEDTLS_SSL_DEBUG_MSG(3, ("server hello, adding server_certificate_type extension"));
+
+    if (end - p < 5) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("buffer too small"));
+        return;
+    }
+
+    MBEDTLS_PUT_UINT16_BE(MBEDTLS_TLS_EXT_SERV_CERT_TYPE, p, 0);
+    p[2] = 0x00;
+    p[3] = 1;
+    p[4] = (unsigned char) ssl->handshake->server_cert_type;
+
+    *olen = 5;
+}
+#endif /* MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT */
+
 #if defined(MBEDTLS_SSL_DTLS_HELLO_VERIFY)
 MBEDTLS_CHECK_RETURN_CRITICAL
 static int ssl_write_hello_verify_request(mbedtls_ssl_context *ssl)
@@ -2308,6 +2504,14 @@ static int ssl_write_server_hello(mbedtls_ssl_context *ssl)
 
 #if defined(MBEDTLS_SSL_DTLS_SRTP)
     ssl_write_use_srtp_ext(ssl, p + 2 + ext_len, &olen);
+    ext_len += olen;
+#endif
+
+#if defined(MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT)
+    ssl_write_client_certificate_type_ext(ssl, p + 2 + ext_len, &olen);
+    ext_len += olen;
+
+    ssl_write_server_certificate_type_ext(ssl, p + 2 + ext_len, &olen);
     ext_len += olen;
 #endif
 

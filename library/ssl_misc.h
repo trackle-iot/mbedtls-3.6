@@ -584,6 +584,9 @@ static inline int mbedtls_ssl_set_in_hsfraglen(mbedtls_ssl_context *ssl,
  */
 #define MBEDTLS_TLS_EXT_SUPPORTED_POINT_FORMATS_PRESENT (1 << 0)
 #define MBEDTLS_TLS_EXT_ECJPAKE_KKPP_OK                 (1 << 1)
+/* Non-upstream RFC 7250 raw public key support. */
+#define MBEDTLS_TLS_EXT_CLIENT_CERTIFICATE_TYPE_PRESENT (1 << 2)
+#define MBEDTLS_TLS_EXT_SERVER_CERTIFICATE_TYPE_PRESENT (1 << 3)
 
 /**
  * \brief        This function checks if the remaining size in a buffer is
@@ -769,6 +772,18 @@ struct mbedtls_ssl_handshake_params {
      * advantage of smaller code size for indirect access on Arm Thumb) */
     uint8_t resume;                     /*!<  session resume indicator*/
     uint8_t cli_exts;                   /*!< client extension presence*/
+
+#if defined(MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT)
+    /* Non-upstream RFC 7250 raw public key support: negotiated certificate
+     * type (MBEDTLS_TLS_CERT_TYPE_XXX) for what "client certificate" and
+     * "server certificate" mean in this handshake. Initialized to
+     * MBEDTLS_TLS_CERT_TYPE_X509 (i.e. plain X.509 certificates, matching
+     * pre-RFC7250 behaviour) and only changed if both sides negotiate raw
+     * public keys via the client_certificate_type/server_certificate_type
+     * extensions. */
+    int client_cert_type;
+    int server_cert_type;
+#endif /* MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT */
 
 #if defined(MBEDTLS_SSL_SERVER_NAME_INDICATION)
     uint8_t sni_authmode;               /*!< authmode from SNI callback     */
@@ -1907,6 +1922,15 @@ int mbedtls_ssl_check_cert_usage(const mbedtls_x509_crt *cert,
                                  uint32_t *flags);
 #endif /* MBEDTLS_X509_CRT_PARSE_C */
 
+#if defined(MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT)
+/* Non-upstream RFC 7250 raw public key support. Return 0 if cert_type is in
+ * our configured client/server_certificate_type_list, -1 otherwise. */
+int mbedtls_ssl_check_client_certificate_type(const mbedtls_ssl_context *ssl,
+                                               int cert_type);
+int mbedtls_ssl_check_server_certificate_type(const mbedtls_ssl_context *ssl,
+                                               int cert_type);
+#endif /* MBEDTLS_SSL_RAW_PUBLIC_KEY_SUPPORT */
+
 void mbedtls_ssl_write_version(unsigned char version[2], int transport,
                                mbedtls_ssl_protocol_version tls_version);
 uint16_t mbedtls_ssl_read_version(const unsigned char version[2],
@@ -2537,7 +2561,10 @@ static inline int mbedtls_ssl_tls13_named_group_is_ffdh(uint16_t named_group)
 static inline int mbedtls_ssl_named_group_is_offered(
     const mbedtls_ssl_context *ssl, uint16_t named_group)
 {
-    const uint16_t *group_list = mbedtls_ssl_get_groups(ssl);
+    /* Explicit cast (implicit in C, required in C++) so this header, which is
+     * only meant for mbedTLS's own .c files, can also be included from C++
+     * consumers (see node-mbed-dtls's src/DtlsSocket.cc). */
+    const uint16_t *group_list = (const uint16_t *) mbedtls_ssl_get_groups(ssl);
 
     if (group_list == NULL) {
         return 0;
@@ -2697,7 +2724,9 @@ int mbedtls_ssl_tls13_check_sig_alg_cert_key_match(uint16_t sig_alg,
 static inline int mbedtls_ssl_sig_alg_is_offered(const mbedtls_ssl_context *ssl,
                                                  uint16_t proposed_sig_alg)
 {
-    const uint16_t *sig_alg = mbedtls_ssl_get_sig_algs(ssl);
+    /* Explicit cast (implicit in C, required in C++), see the analogous cast
+     * in mbedtls_ssl_named_group_is_offered() above. */
+    const uint16_t *sig_alg = (const uint16_t *) mbedtls_ssl_get_sig_algs(ssl);
     if (sig_alg == NULL) {
         return 0;
     }
